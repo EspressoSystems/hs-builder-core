@@ -40,11 +40,12 @@ mod tests {
         BuiltFromProposedBlock, DaProposalMessage, DecideMessage, QCMessage, RequestMessage,
         TransactionSource,
     };
-    use crate::service::{handle_received_txns, GlobalState, ReceivedTransaction};
+    use crate::service::{
+        handle_received_txns, BuilderTransaction, GlobalState, ReceivedTransaction,
+    };
     use async_lock::RwLock;
     use async_std::task;
     use committable::{Commitment, CommitmentBoundsArkless, Committable};
-    use sha2::{Digest, Sha256};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -81,10 +82,35 @@ mod tests {
             type Membership = GeneralStaticCommittee<TestTypes, Self::SignatureKey>;
             type BuilderSignatureKey = BuilderKey;
         }
+
+        #[derive(
+            Clone,
+            Copy,
+            Debug,
+            Default,
+            Hash,
+            PartialEq,
+            Eq,
+            PartialOrd,
+            Ord,
+            Serialize,
+            Deserialize,
+        )]
+        pub struct TestNamespaceId(u8);
+
+        impl BuilderTransaction for TestTransaction {
+            type NamespaceId = TestNamespaceId;
+
+            fn namespace_id(&self) -> Self::NamespaceId {
+                TestNamespaceId(*self.bytes().first().unwrap_or(&0))
+            }
+        }
+
         // no of test messages to send
         let num_test_messages = 5;
         let multiplication_factor = 5;
         const TEST_NUM_NODES_IN_VID_COMPUTATION: usize = 4;
+        const TEST_NSID: Option<TestNamespaceId> = Some(TestNamespaceId(10));
 
         // settingup the broadcast channels i.e [From hostshot: (tx, decide, da, qc, )], [From api:(req - broadcast, res - mpsc channel) ]
         let (decide_sender, decide_receiver) =
@@ -105,9 +131,9 @@ mod tests {
             BLSPubKey::generated_from_seed_indexed(seed, 2011_u64);
         // instantiate the global state also
         let global_state = GlobalState::<TestTypes>::new(
+            TEST_NSID,
             bootstrap_sender,
             tx_sender.clone(),
-            // tx_queue.clone(),
             vid_commitment(&[], 8),
             ViewNumber::new(0),
             ViewNumber::new(0),
@@ -116,7 +142,7 @@ mod tests {
 
         // to store all the sent messages
         let mut sdecide_msgs: Vec<DecideMessage<TestTypes>> = Vec::new();
-        let mut sda_msgs: Vec<DaProposalMessage<TestTypes>> = Vec::new();
+        let mut sda_msgs: Vec<Arc<DaProposalMessage<TestTypes>>> = Vec::new();
         let mut sqc_msgs: Vec<QCMessage<TestTypes>> = Vec::new();
         #[allow(clippy::type_complexity)]
         let mut sreq_msgs: Vec<(
@@ -133,45 +159,29 @@ mod tests {
             // Prepare the transaction message
             let tx = TestTransaction::new(vec![i as u8]);
             let encoded_transactions = TestTransaction::encode(&[tx.clone()]);
-
-            // Prepare the DA proposal message
-            let da_proposal = DaProposal {
-                encoded_transactions: encoded_transactions.clone().into(),
-                metadata: TestMetadata,
-                view_number: ViewNumber::new(i as u64),
+            let block_payload = TestBlockPayload {
+                transactions: vec![tx.clone()],
             };
-            let encoded_transactions_hash = Sha256::digest(&encoded_transactions);
+            let metadata = TestMetadata {};
+
             let seed = [i as u8; 32];
             let (pub_key, private_key) = BLSPubKey::generated_from_seed_indexed(seed, i as u64);
-            let da_signature =
-            <TestTypes as hotshot_types::traits::node_implementation::NodeType>::SignatureKey::sign(
-                &private_key,
-                &encoded_transactions_hash,
-            )
-            .expect("Failed to sign encoded tx hash while preparing da proposal");
 
-            let sda_msg = DaProposalMessage::<TestTypes> {
-                proposal: Arc::new(Proposal {
-                    data: da_proposal,
-                    signature: da_signature.clone(),
-                    _pd: PhantomData,
-                }),
+            let sda_msg = DaProposalMessage {
+                view_number: ViewNumber::new(i as u64),
+                txn_commitments: vec![tx.commit()],
+                num_nodes: TEST_NUM_NODES_IN_VID_COMPUTATION,
                 sender: pub_key,
-                total_nodes: TEST_NUM_NODES_IN_VID_COMPUTATION,
+                builder_commitment:
+                    <TestBlockPayload as BlockPayload<TestTypes>>::builder_commitment(
+                        &block_payload,
+                        &metadata,
+                    ),
             };
+            let sda_msg = Arc::new(sda_msg);
 
             // Prepare the QC proposal message
             // calculate the vid commitment over the encoded_transactions
-
-            let (block_payload, metadata) =
-                <TestBlockPayload as BlockPayload<TestTypes>>::from_transactions(
-                    vec![tx.clone()],
-                    &TestValidatedState::default(),
-                    &TestInstanceState {},
-                )
-                .await
-                .unwrap();
-
             tracing::debug!(
                 "Encoded transactions: {:?} Num nodes:{}",
                 encoded_transactions,
@@ -299,11 +309,16 @@ mod tests {
             // validate the signature before pushing the message to the builder_state channels
             // currently this step happens in the service.rs, wheneve we receiver an hotshot event
             tracing::debug!("Sending transaction message: {:?}", tx);
-            handle_received_txns(&tx_sender, vec![tx.clone()], TransactionSource::HotShot)
-                .await
-                .unwrap();
+            handle_received_txns(
+                &tx_sender,
+                vec![tx.clone()],
+                TransactionSource::HotShot,
+                TEST_NSID,
+            )
+            .await
+            .unwrap();
             da_sender
-                .broadcast(MessageType::DaProposalMessage(sda_msg.clone()))
+                .broadcast(MessageType::DaProposalMessage(Arc::clone(&sda_msg)))
                 .await
                 .unwrap();
             qc_sender
@@ -351,6 +366,7 @@ mod tests {
                 tx_receiver,
                 tx_queue,
                 arc_rwlock_global_state_clone,
+                TEST_NSID,
                 NonZeroUsize::new(TEST_NUM_NODES_IN_VID_COMPUTATION).unwrap(),
                 Duration::from_millis(10), // max time to wait for non-zero txn block
                 0,                         // base fee
